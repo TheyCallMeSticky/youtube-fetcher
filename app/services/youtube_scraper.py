@@ -17,6 +17,8 @@ from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +33,8 @@ if not YOUTUBE_USER_AGENT:
 
 def _create_session() -> requests.Session:
     session = requests.Session()
+    retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
+    session.mount("https://", HTTPAdapter(max_retries=retry))
     session.headers.update({
         "User-Agent": YOUTUBE_USER_AGENT,
         "Accept-Language": "en-US,en;q=0.9",
@@ -51,7 +55,7 @@ def scrape_search(query: str, max_results: int = 20, output_format: str = "stand
     url = f"https://www.youtube.com/results?search_query={quote(query)}&page=1"
 
     try:
-        response = _session.get(url, timeout=15)
+        response = _session.get(url, timeout=30)
         response.raise_for_status()
     except requests.RequestException as e:
         logger.error(f"YouTube scrape request failed: {e}")

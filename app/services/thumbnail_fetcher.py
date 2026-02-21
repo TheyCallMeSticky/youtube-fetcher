@@ -51,7 +51,8 @@ def _detect_media_type(data: bytes, content_type: str) -> str:
 
 
 async def _download_all(thumbnail_urls: List[str], max_thumbnails: int) -> List[Dict]:
-    async with httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT) as client:
+    transport = httpx.AsyncHTTPTransport(retries=3)
+    async with httpx.AsyncClient(timeout=DOWNLOAD_TIMEOUT, transport=transport) as client:
         semaphore = asyncio.Semaphore(CONCURRENT_DOWNLOADS)
 
         async def download_with_limit(url: str) -> Tuple[str, Optional[Tuple[bytes, str]]]:
