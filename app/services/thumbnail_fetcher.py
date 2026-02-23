@@ -7,7 +7,11 @@ instead of the YouTube Data API v3.
 import asyncio
 import base64
 import logging
+import os
+import re
+from datetime import datetime
 from typing import Dict, List, Optional, Tuple
+from urllib.parse import quote
 
 import httpx
 
@@ -17,6 +21,13 @@ logger = logging.getLogger(__name__)
 
 CONCURRENT_DOWNLOADS = 10
 DOWNLOAD_TIMEOUT = 30.0
+DEBUG_THUMBNAILS_DIR = "/app/cache/debug-thumbnails"
+
+MEDIA_EXTENSIONS = {
+    "image/webp": ".webp",
+    "image/png": ".png",
+    "image/jpeg": ".jpg",
+}
 
 
 async def _download_thumbnail(
@@ -34,7 +45,7 @@ async def _download_thumbnail(
 
 
 def _detect_media_type(data: bytes, content_type: str) -> str:
-    """Detect actual media type from file magic bytes, fallback to content-type header."""
+    """Detect actual media type from file magic bytes."""
     if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
         return "image/webp"
     if data[:8] == b"\x89PNG\r\n\x1a\n":
@@ -48,6 +59,39 @@ def _detect_media_type(data: bytes, content_type: str) -> str:
         return "image/png"
 
     return "image/jpeg"
+
+
+def _sanitize_filename(text: str) -> str:
+    return re.sub(r'[^\w\s-]', '', text).strip().replace(' ', '_')[:80]
+
+
+def _log_scrape_results(query: str, videos: List[Dict]) -> None:
+    youtube_url = f"https://www.youtube.com/results?search_query={quote(query)}"
+    logger.info(f"[THUMBNAILS] YouTube search: {youtube_url}")
+    logger.info(f"[THUMBNAILS] Found {len(videos)} videos:")
+    for i, video in enumerate(videos):
+        title = video.get("title", "?")
+        views = video.get("views", 0)
+        video_id = video.get("video_id", "?")
+        logger.info(f"  [{i+1:02d}] {title} | {views:,} views | {video_id}")
+
+
+def _save_thumbnails_to_disk(
+    query: str, thumbnails: List[Dict]
+) -> None:
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    slug = _sanitize_filename(query)
+    folder = os.path.join(DEBUG_THUMBNAILS_DIR, f"{timestamp}_{slug}")
+    os.makedirs(folder, exist_ok=True)
+
+    for i, thumb in enumerate(thumbnails):
+        ext = MEDIA_EXTENSIONS.get(thumb["media_type"], ".jpg")
+        video_id = thumb["url"].split("/vi/")[-1].split("/")[0]
+        filepath = os.path.join(folder, f"{i+1:02d}_{video_id}{ext}")
+        with open(filepath, "wb") as f:
+            f.write(base64.standard_b64decode(thumb["base64"]))
+
+    logger.info(f"[THUMBNAILS] Saved {len(thumbnails)} images to {folder}")
 
 
 async def _download_all(thumbnail_urls: List[str], max_thumbnails: int) -> List[Dict]:
@@ -78,10 +122,14 @@ async def _download_all(thumbnail_urls: List[str], max_thumbnails: int) -> List[
 
 def fetch_thumbnails(query: str, max_thumbnails: int = 20) -> Optional[Dict]:
     """Scrape YouTube search, extract thumbnail URLs, download and encode as base64."""
+    logger.info(f"[THUMBNAILS] Query: '{query}' (max: {max_thumbnails})")
+
     scrape_result = scrape_search(query, max_results=max_thumbnails + 5)
     if not scrape_result:
         logger.error(f"Scrape failed for thumbnail query: {query}")
         return None
+
+    _log_scrape_results(query, scrape_result["videos"])
 
     thumbnail_urls = [
         video["thumbnail"]
@@ -98,6 +146,8 @@ def fetch_thumbnails(query: str, max_thumbnails: int = 20) -> Optional[Dict]:
     if not thumbnails:
         logger.error(f"Failed to download any thumbnails for query: {query}")
         return None
+
+    _save_thumbnails_to_disk(query, thumbnails)
 
     return {
         "query": query,
