@@ -21,7 +21,7 @@ queue = Queue("youtube_fetch_jobs", connection=redis_conn)
 @router.post("/fetch", response_model=JobResponse, status_code=202)
 def enqueue_thumbnail_fetch(request: ThumbnailFetchRequest):
     job_id = str(uuid.uuid4())
-    job_store.create(job_id, "thumbnail")
+    job_store.create(job_id)
 
     queue.enqueue(
         "app.services.jobs.process_thumbnail_job",

@@ -1,7 +1,7 @@
 """Redis-backed job status store for tracking RQ job progress.
 
 Each job is stored as a Redis hash: yt_job:{job_id}
-Fields: status, progress, result (JSON), error, job_type
+Fields: status, progress, result (JSON), error
 TTL: 1 hour after completion.
 """
 
@@ -21,11 +21,10 @@ def _key(job_id: str) -> str:
     return f"{JOB_KEY_PREFIX}{job_id}"
 
 
-def create(job_id: str, job_type: str) -> None:
+def create(job_id: str) -> None:
     redis_conn.hset(_key(job_id), mapping={
         "status": "queued",
         "progress": 0,
-        "job_type": job_type,
     })
 
 

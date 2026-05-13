@@ -20,7 +20,7 @@ queue = Queue("youtube_fetch_jobs", connection=redis_conn)
 @router.post("/scrape", response_model=JobResponse, status_code=202)
 def enqueue_scrape(request: ScrapeRequest):
     job_id = str(uuid.uuid4())
-    job_store.create(job_id, "scrape")
+    job_store.create(job_id)
 
     queue.enqueue(
         "app.services.jobs.process_scrape_job",

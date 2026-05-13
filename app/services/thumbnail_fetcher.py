@@ -19,6 +19,8 @@ from app.services.youtube_scraper import scrape_search
 
 logger = logging.getLogger(__name__)
 
+_APP_ENV = os.getenv("APP_ENV", "production")
+
 CONCURRENT_DOWNLOADS = 10
 DOWNLOAD_TIMEOUT = 30.0
 DEBUG_THUMBNAILS_DIR = "/app/cache/debug-thumbnails"
@@ -147,7 +149,8 @@ def fetch_thumbnails(query: str, max_thumbnails: int = 20) -> Optional[Dict]:
         logger.error(f"Failed to download any thumbnails for query: {query}")
         return None
 
-    _save_thumbnails_to_disk(query, thumbnails)
+    if _APP_ENV != "production":
+        _save_thumbnails_to_disk(query, thumbnails)
 
     return {
         "query": query,
