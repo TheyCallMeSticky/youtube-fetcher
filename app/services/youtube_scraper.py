@@ -30,6 +30,9 @@ YOUTUBE_USER_AGENT = os.getenv("YOUTUBE_USER_AGENT")
 if not YOUTUBE_USER_AGENT:
     raise ValueError("YOUTUBE_USER_AGENT is required")
 
+# Proxy résidentiel rotatif (optionnel) : route le scraping via une IP tournante.
+PROXY_URL = os.getenv("YOUTUBE_FETCHER_PROXY_URL")
+
 
 def _create_session() -> requests.Session:
     session = requests.Session()
@@ -40,6 +43,8 @@ def _create_session() -> requests.Session:
         "Accept-Language": "en-US,en;q=0.9",
         "Cookie": YOUTUBE_COOKIES,
     })
+    if PROXY_URL:
+        session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
     return session
 
 
