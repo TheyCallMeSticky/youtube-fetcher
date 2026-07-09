@@ -1,24 +1,25 @@
-"""YouTube search scraper — scrape real YouTube search results via ytInitialData.
+"""YouTube data fetcher — via l'API interne InnerTube (youtubei/v1/*), pas de scraping de page.
 
-Merged from:
-- niche-finder/app/services/youtube_scraper.py (base, cleaner code)
-- yt-scorer/app/services/scoring_service.py (TubeBuddy format + thumbnail extraction)
+InnerTube est l'API JSON qu'utilise le client web youtube.com lui-même : mêmes données que
+ytInitialData mais renvoyées EN JSON (pas de page HTML ~500 KB à parser) → bien moins de CPU
+par requête, limites bien plus hautes, plus sûr côté bans. Les renderers sont identiques à ceux
+de ytInitialData → tout le parsing ci-dessous est réutilisé tel quel.
 
 Supports two output formats:
 - "standard": snake_case keys, views parsed as int (for niche-finder, thumbnails)
 - "tubebuddy": PascalCase keys matching TubeBuddy API expectations (for yt-scorer)
 """
 
-import json
 import logging
 import os
 import re
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote
 
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+
+from app.core.redis import redis_conn
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +31,24 @@ YOUTUBE_USER_AGENT = os.getenv("YOUTUBE_USER_AGENT")
 if not YOUTUBE_USER_AGENT:
     raise ValueError("YOUTUBE_USER_AGENT is required")
 
-# Proxy résidentiel rotatif (optionnel) : route le scraping via une IP tournante.
+# Proxy résidentiel rotatif (optionnel). Stratégie coût : IP LOCALE par défaut (gratuite) ;
+# sur un 429 en direct → bascule proxy pour PROXY_WINDOW_SECONDS (état partagé entre workers
+# via Redis), puis retour auto à l'IP locale. Le proxy ne sert donc que pendant les throttles.
 PROXY_URL = os.getenv("YOUTUBE_FETCHER_PROXY_URL")
+PROXY_FLAG_KEY = "scrape:use_proxy"
+PROXY_WINDOW_SECONDS = 7200  # 2h de proxy après un 429, puis on retente l'IP locale
+
+# InnerTube : clé et version du client web YouTube. La clé est publique et stable depuis des
+# années ; la version est très tolérante (une valeur « périmée » passe encore) → surchargeable
+# par env si YouTube resserre un jour, sinon les défauts suffisent.
+INNERTUBE_KEY = os.getenv("YOUTUBE_INNERTUBE_KEY", "AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8")
+INNERTUBE_CLIENT_VERSION = os.getenv("YOUTUBE_INNERTUBE_CLIENT_VERSION", "2.20240401.00.00")
+INNERTUBE_CONTEXT = {
+    "client": {"clientName": "WEB", "clientVersion": INNERTUBE_CLIENT_VERSION, "hl": "en", "gl": "US"}
+}
 
 
-def _create_session() -> requests.Session:
+def _create_session(proxy: Optional[str] = None) -> requests.Session:
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     session.mount("https://", HTTPAdapter(max_retries=retry))
@@ -43,36 +57,58 @@ def _create_session() -> requests.Session:
         "Accept-Language": "en-US,en;q=0.9",
         "Cookie": YOUTUBE_COOKIES,
     })
-    if PROXY_URL:
-        session.proxies.update({"http": PROXY_URL, "https": PROXY_URL})
+    if proxy:
+        session.proxies.update({"http": proxy, "https": proxy})
     return session
 
 
-_session = _create_session()
+_session_direct = _create_session()
+_session_proxy = _create_session(PROXY_URL) if PROXY_URL else None
+
+
+def _proxy_window_active() -> bool:
+    """Sommes-nous dans une fenêtre proxy (429 récent, TTL non expiré) ? Partagé via Redis."""
+    return _session_proxy is not None and bool(redis_conn.exists(PROXY_FLAG_KEY))
+
+
+def _open_proxy_window() -> None:
+    """Bascule TOUS les workers sur le proxy pour PROXY_WINDOW_SECONDS."""
+    redis_conn.set(PROXY_FLAG_KEY, b"1", ex=PROXY_WINDOW_SECONDS)
+    logger.warning(f"429 sur IP locale → bascule PROXY pour {PROXY_WINDOW_SECONDS // 3600}h")
+
+
+def _innertube_post(endpoint: str, payload: Dict) -> requests.Response:
+    """POST vers InnerTube (youtubei/v1/{endpoint}) avec la stratégie proxy : IP locale par
+    défaut, bascule proxy 2h sur un 429 en direct (état partagé entre workers via Redis).
+    Mêmes sessions (UA + proxy) que l'ancien GET — on ne change que le transport."""
+    url = f"https://www.youtube.com/youtubei/v1/{endpoint}?key={INNERTUBE_KEY}&prettyPrint=false"
+    body = {"context": INNERTUBE_CONTEXT, **payload}
+    if _proxy_window_active():
+        return _session_proxy.post(url, json=body, timeout=30)
+    response = _session_direct.post(url, json=body, timeout=30)
+    if response.status_code == 429 and _session_proxy is not None:
+        _open_proxy_window()
+        return _session_proxy.post(url, json=body, timeout=30)
+    return response
 
 
 def scrape_search(query: str, max_results: int = 20, output_format: str = "standard") -> Optional[Dict]:
-    """Scrape YouTube search results page.
+    """Recherche YouTube via InnerTube (youtubei/v1/search).
 
     Returns { estimated_results, videos[] } or None on failure.
     output_format: "standard" (snake_case, int views) or "tubebuddy" (PascalCase, text views).
     """
-    url = f"https://www.youtube.com/results?search_query={quote(query)}&page=1"
-
     try:
-        response = _session.get(url, timeout=30)
+        response = _innertube_post("search", {"query": query})
         response.raise_for_status()
-    except requests.RequestException as e:
-        logger.error(f"YouTube scrape request failed: {e}")
-        return None
-
-    yt_data = _extract_yt_initial_data(response.text)
-    if not yt_data:
+        yt_data = response.json()
+    except (requests.RequestException, ValueError) as e:
+        logger.error(f"InnerTube search request failed: {e}")
         return None
 
     estimated_results = _find_key_recursive(yt_data, "estimatedResults")
     if not estimated_results:
-        logger.warning("estimatedResults not found in ytInitialData")
+        logger.warning("estimatedResults not found in InnerTube response")
         return None
 
     renderers = _extract_video_renderers(yt_data)
@@ -86,46 +122,6 @@ def scrape_search(query: str, max_results: int = 20, output_format: str = "stand
         "estimated_results": int(estimated_results),
         "videos": videos,
     }
-
-
-def _extract_yt_initial_data(html: str) -> Optional[Dict]:
-    marker = "var ytInitialData = "
-    start = html.find(marker)
-    if start == -1:
-        logger.warning("No ytInitialData found in YouTube page")
-        return None
-
-    start += len(marker)
-    brace_count = 0
-    in_string = False
-    escape = False
-    end = start
-
-    for i in range(start, len(html)):
-        char = html[i]
-        if escape:
-            escape = False
-            continue
-        if char == "\\":
-            escape = True
-            continue
-        if char == '"' and not escape:
-            in_string = not in_string
-            continue
-        if not in_string:
-            if char == "{":
-                brace_count += 1
-            elif char == "}":
-                brace_count -= 1
-                if brace_count == 0:
-                    end = i + 1
-                    break
-
-    try:
-        return json.loads(html[start:end])
-    except json.JSONDecodeError as e:
-        logger.error(f"Failed to parse ytInitialData JSON: {e}")
-        return None
 
 
 def _extract_video_renderers(yt_data: Dict) -> List[Dict]:
@@ -266,6 +262,35 @@ def _find_key_recursive(data: Any, key: str) -> Any:
             if result is not None:
                 return result
     return None
+
+
+def scrape_video_description(video_id: str) -> Optional[str]:
+    """Description COMPLÈTE d'une vidéo via InnerTube (youtubei/v1/player → videoDetails.shortDescription).
+
+    Renvoie la description (chaîne, éventuellement vide), ou None si la vidéo est indisponible
+    (supprimée/privée — videoDetails absent, l'API Data l'omet aussi).
+    """
+    response = _innertube_post("player", {"videoId": video_id})
+    response.raise_for_status()
+    details = response.json().get("videoDetails")
+    if not details:
+        return None
+    return details.get("shortDescription", "")
+
+
+_SUBSCRIBER_RE = re.compile(r"([\d.,]+\s*[KMB]?)\s+subscribers", re.IGNORECASE)
+
+
+def scrape_channel_subscribers(channel_id: str) -> Optional[int]:
+    """Nb d'abonnés d'une chaîne via InnerTube (youtubei/v1/browse → "X subscribers", arrondi
+    3 chiffres sig. comme l'API depuis 2019). Renvoie l'entier, ou None si le compte est
+    caché/introuvable."""
+    response = _innertube_post("browse", {"browseId": channel_id})
+    response.raise_for_status()
+    match = _SUBSCRIBER_RE.search(response.text)
+    if not match:
+        return None
+    return parse_view_count(match.group(1))
 
 
 def parse_view_count(text: str) -> int:

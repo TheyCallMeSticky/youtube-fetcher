@@ -1,14 +1,18 @@
-"""Synchronous endpoints for YouTube Data API v3 (video descriptions, channel stats).
+"""Endpoints synchrones pour descriptions de vidéos + abonnés de chaînes.
 
-Unlike scrape/thumbnail endpoints, these do NOT go through RQ — API v3 calls
-are fast (<1s) and don't need background processing.
+Stratégie hybride : API Data v3 en premier (rapide, batchée). Quand le quota est épuisé
+(YOUTUBE_QUOTA_EXCEEDED), on BASCULE sur le scraping (mêmes données : descriptions complètes,
+abonnés arrondis à 3 chiffres sig. comme l'API) → jamais de blocage. Le scraping ne coûte
+qu'en requêtes (pas de batch), donc réservé au fallback.
 """
 
 import logging
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi import APIRouter, Depends, HTTPException
 
 from app.core.auth import verify_api_key
+from app.core.redis import redis_conn
 from app.schemas.youtube_api import (
     ChannelSubscribersRequest,
     ChannelSubscribersResponse,
@@ -16,6 +20,10 @@ from app.schemas.youtube_api import (
     VideoDescriptionsResponse,
 )
 from app.services.youtube_api import YouTubeDataAPI
+from app.services.youtube_scraper import (
+    scrape_channel_subscribers,
+    scrape_video_description,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -27,26 +35,63 @@ router = APIRouter(
 
 _youtube_api = YouTubeDataAPI()
 
+_SCRAPE_WORKERS = 6                      # parallélisme du fallback (1 page par item, sinon lent)
+_SUBS_CACHE_TTL = 7 * 24 * 3600         # 7 j — abonnés stables + grosse réutilisation des chaînes
+
+
+def _is_quota_exceeded(err: Exception) -> bool:
+    return "YOUTUBE_QUOTA_EXCEEDED" in str(err)
+
+
+def _scrape_descriptions(video_ids: list[str]) -> dict:
+    """Fallback : descriptions complètes via InnerTube (youtubei/v1/player, parallélisé)."""
+    with ThreadPoolExecutor(max_workers=_SCRAPE_WORKERS) as pool:
+        results = list(pool.map(scrape_video_description, video_ids))
+    return {vid: {"description": d} for vid, d in zip(video_ids, results) if d is not None}
+
+
+def _scrape_subscribers(channel_ids: list[str]) -> dict:
+    """Fallback : abonnés via scraping des pages chaîne, avec cache Redis par chaîne
+    (les gros producteurs reviennent sur des milliers de niches → quasi que du cache)."""
+    out: dict = {}
+    missing: list[str] = []
+    for cid in channel_ids:
+        cached = redis_conn.get(f"subs:{cid}")
+        if cached is not None:
+            out[cid] = int(cached)
+        else:
+            missing.append(cid)
+
+    with ThreadPoolExecutor(max_workers=_SCRAPE_WORKERS) as pool:
+        scraped = list(pool.map(scrape_channel_subscribers, missing))
+    for cid, subs in zip(missing, scraped):
+        if subs is not None:
+            redis_conn.set(f"subs:{cid}", subs, ex=_SUBS_CACHE_TTL)
+            out[cid] = subs
+    return out
+
 
 @router.post("/videos", response_model=VideoDescriptionsResponse)
 def get_video_descriptions(request: VideoDescriptionsRequest):
-    """Fetch full video descriptions from YouTube Data API v3."""
+    """Descriptions complètes : API d'abord, scraping si quota épuisé."""
     try:
         descriptions = _youtube_api.get_video_descriptions(request.video_ids)
-        return VideoDescriptionsResponse(descriptions=descriptions)
     except Exception as e:
-        if "YOUTUBE_QUOTA_EXCEEDED" in str(e):
-            raise HTTPException(status_code=429, detail="YouTube API quota exceeded")
-        raise HTTPException(status_code=502, detail=f"YouTube API error: {e}")
+        if not _is_quota_exceeded(e):
+            raise HTTPException(status_code=502, detail=f"YouTube API error: {e}")
+        logger.warning(f"Quota API épuisé → scraping de {len(request.video_ids)} descriptions")
+        descriptions = _scrape_descriptions(request.video_ids)
+    return VideoDescriptionsResponse(descriptions=descriptions)
 
 
 @router.post("/channels", response_model=ChannelSubscribersResponse)
 def get_channel_subscribers(request: ChannelSubscribersRequest):
-    """Fetch channel subscriber counts from YouTube Data API v3."""
+    """Abonnés : API d'abord, scraping (+ cache) si quota épuisé."""
     try:
         subscribers = _youtube_api.get_channel_subscribers(request.channel_ids)
-        return ChannelSubscribersResponse(subscribers=subscribers)
     except Exception as e:
-        if "YOUTUBE_QUOTA_EXCEEDED" in str(e):
-            raise HTTPException(status_code=429, detail="YouTube API quota exceeded")
-        raise HTTPException(status_code=502, detail=f"YouTube API error: {e}")
+        if not _is_quota_exceeded(e):
+            raise HTTPException(status_code=502, detail=f"YouTube API error: {e}")
+        logger.warning(f"Quota API épuisé → scraping de {len(request.channel_ids)} chaînes")
+        subscribers = _scrape_subscribers(request.channel_ids)
+    return ChannelSubscribersResponse(subscribers=subscribers)

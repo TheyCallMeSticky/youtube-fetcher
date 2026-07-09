@@ -18,10 +18,6 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://www.googleapis.com/youtube/v3"
 
-# Proxy résidentiel rotatif (optionnel) : route aussi les appels via une IP tournante.
-_PROXY = os.getenv("YOUTUBE_FETCHER_PROXY_URL")
-_PROXIES = {"http": _PROXY, "https": _PROXY} if _PROXY else None
-
 
 class YouTubeDataAPI:
     """YouTube Data API v3 with multi-key rotation and file-based caching."""
@@ -80,7 +76,7 @@ class YouTubeDataAPI:
                 continue
 
             params["key"] = current_key
-            response = requests.get(f"{BASE_URL}/{endpoint}", params=params, proxies=_PROXIES)
+            response = requests.get(f"{BASE_URL}/{endpoint}", params=params)
 
             if response.status_code == 200:
                 result = response.json()
