@@ -23,6 +23,7 @@ from app.services.youtube_api import YouTubeDataAPI
 from app.services.youtube_scraper import (
     scrape_channel_subscribers,
     scrape_video_description,
+    scrape_video_details,
 )
 
 logger = logging.getLogger(__name__)
@@ -43,10 +44,22 @@ def _is_quota_exceeded(err: Exception) -> bool:
     return "YOUTUBE_QUOTA_EXCEEDED" in str(err)
 
 
+def _safe_map(fn, items: list) -> list:
+    """pool.map robuste : un item qui LÈVE (vidéo/chaîne morte, browse en erreur) → None au lieu
+    de crasher toute la batch (sinon 1 mauvais id fait échouer les 50). Le None = 'pas de donnée'
+    (l'appelant l'ignore / marque l'entité comme traitée sans data)."""
+    def one(x):
+        try:
+            return fn(x)
+        except Exception:
+            return None
+    with ThreadPoolExecutor(max_workers=_SCRAPE_WORKERS) as pool:
+        return list(pool.map(one, items))
+
+
 def _scrape_descriptions(video_ids: list[str]) -> dict:
     """Fallback : descriptions complètes via InnerTube (youtubei/v1/player, parallélisé)."""
-    with ThreadPoolExecutor(max_workers=_SCRAPE_WORKERS) as pool:
-        results = list(pool.map(scrape_video_description, video_ids))
+    results = _safe_map(scrape_video_description, video_ids)
     return {vid: {"description": d} for vid, d in zip(video_ids, results) if d is not None}
 
 
@@ -62,8 +75,7 @@ def _scrape_subscribers(channel_ids: list[str]) -> dict:
         else:
             missing.append(cid)
 
-    with ThreadPoolExecutor(max_workers=_SCRAPE_WORKERS) as pool:
-        scraped = list(pool.map(scrape_channel_subscribers, missing))
+    scraped = _safe_map(scrape_channel_subscribers, missing)
     for cid, subs in zip(missing, scraped):
         if subs is not None:
             redis_conn.set(f"subs:{cid}", subs, ex=_SUBS_CACHE_TTL)
@@ -95,3 +107,25 @@ def get_channel_subscribers(request: ChannelSubscribersRequest):
         logger.warning(f"Quota API épuisé → scraping de {len(request.channel_ids)} chaînes")
         subscribers = _scrape_subscribers(request.channel_ids)
     return ChannelSubscribersResponse(subscribers=subscribers)
+
+
+# ───── Endpoints SCRAPE-DIRECT (pas d'API) : pour l'enrichissement Phase 2 en volume ─────
+
+def _scrape_video_details(video_ids: list[str]) -> dict:
+    """Descriptions + date de publication ABSOLUE via InnerTube (player), parallélisé (robuste)."""
+    results = _safe_map(scrape_video_details, video_ids)
+    return {vid: d for vid, d in zip(video_ids, results) if d is not None}
+
+
+@router.post("/videos/details")
+def scrape_videos_details(request: VideoDescriptionsRequest):
+    """Descriptions + date absolue par SCRAPE direct (InnerTube, sans quota). Pour la Phase 2.
+    Renvoie {details: {video_id: {description, published_date}}}."""
+    return {"details": _scrape_video_details(request.video_ids)}
+
+
+@router.post("/channels/subs")
+def scrape_channels_subs(request: ChannelSubscribersRequest):
+    """Abonnés par SCRAPE direct (InnerTube + cache Redis, sans quota). Pour la Phase 2.
+    Renvoie {subscribers: {channel_id: n}}."""
+    return {"subscribers": _scrape_subscribers(request.channel_ids)}

@@ -13,6 +13,7 @@ Supports two output formats:
 import logging
 import os
 import re
+from datetime import datetime
 from typing import Any, Dict, List, Optional
 
 import requests
@@ -264,18 +265,72 @@ def _find_key_recursive(data: Any, key: str) -> Any:
     return None
 
 
-def scrape_video_description(video_id: str) -> Optional[str]:
-    """Description COMPLÈTE d'une vidéo via InnerTube (youtubei/v1/player → videoDetails.shortDescription).
+def _dig_attributed_description(node: Any) -> Optional[str]:
+    """Description complète depuis attributedDescription.content (endpoint next → panneau
+    description de la watch page). Prend la PLUS LONGUE si plusieurs (la vraie description vs des
+    micro-textes attribués). None si aucune (vidéo indispo / description vide)."""
+    best: Optional[str] = None
+    stack = [node]
+    while stack:
+        cur = stack.pop()
+        if isinstance(cur, dict):
+            attr = cur.get("attributedDescription")
+            if isinstance(attr, dict):
+                content = attr.get("content")
+                if content and (best is None or len(content) > len(best)):
+                    best = content
+            stack.extend(cur.values())
+        elif isinstance(cur, list):
+            stack.extend(cur)
+    return best
 
-    Renvoie la description (chaîne, éventuellement vide), ou None si la vidéo est indisponible
-    (supprimée/privée — videoDetails absent, l'API Data l'omet aussi).
-    """
-    response = _innertube_post("player", {"videoId": video_id})
-    response.raise_for_status()
-    details = response.json().get("videoDetails")
-    if not details:
+
+_DATE_PREFIXES = ("Premiered ", "Premieres ", "Streamed live on ", "Started streaming on ")
+
+
+def _parse_watch_date(date_text: Optional[str]) -> Optional[str]:
+    """dateText de la watch page ('Aug 19, 2020', 'Premiered Jan 5, 2023') → date ISO. None si
+    non-parsable (locale inattendue / date relative)."""
+    if not date_text:
         return None
-    return details.get("shortDescription", "")
+    txt = date_text.strip()
+    for prefix in _DATE_PREFIXES:
+        if txt.startswith(prefix):
+            txt = txt[len(prefix):]
+            break
+    try:
+        return datetime.strptime(txt, "%b %d, %Y").date().isoformat()
+    except ValueError:
+        return None
+
+
+def scrape_video_description(video_id: str) -> Optional[str]:
+    """Description COMPLÈTE d'une vidéo via InnerTube (youtubei/v1/next → attributedDescription).
+
+    On passe par 'next' et PAS 'player' : YouTube gate 'player' derrière un login
+    (playabilityStatus=LOGIN_REQUIRED) mais laisse 'next' (panneau description) ouvert. Renvoie la
+    description, ou None si la vidéo est indisponible (supprimée/privée / description vide).
+    """
+    response = _innertube_post("next", {"videoId": video_id})
+    response.raise_for_status()
+    return _dig_attributed_description(response.json())
+
+
+def scrape_video_details(video_id: str) -> Optional[dict]:
+    """Description COMPLÈTE + date de publication ABSOLUE via InnerTube (youtubei/v1/next). On
+    utilise 'next' et PAS 'player' : YouTube exige un login sur 'player' (LOGIN_REQUIRED) mais laisse
+    'next' ouvert. La description vient de attributedDescription.content, la date absolue de
+    dateText.simpleText ('Aug 19, 2020' — au scrape recherche on n'a que du relatif). Renvoie
+    {description, published_date}, ou None si la vidéo est indisponible."""
+    response = _innertube_post("next", {"videoId": video_id})
+    response.raise_for_status()
+    data = response.json()
+    description = _dig_attributed_description(data)
+    if description is None:
+        return None
+    date_text = _find_key_recursive(data, "dateText")
+    published = _parse_watch_date(date_text.get("simpleText")) if isinstance(date_text, dict) else None
+    return {"description": description, "published_date": published}
 
 
 _SUBSCRIBER_RE = re.compile(r"([\d.,]+\s*[KMB]?)\s+subscribers", re.IGNORECASE)
