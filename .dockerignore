@@ -1,0 +1,18 @@
+__pycache__
+*.pyc
+env
+.venv
+.git
+.gitignore
+*.md
+Dockerfile*
+.dockerignore
+*.log
+
+# Cache d'exécution (réponses YouTube + vignettes de debug, plusieurs Go) : monté en volume
+# au run, jamais embarqué dans l'image.
+cache
+
+# Secrets : fournis au run par env_file, pas cuits dans l'image.
+.env
+.env.prod
