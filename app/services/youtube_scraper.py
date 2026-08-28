@@ -35,6 +35,7 @@ if not YOUTUBE_USER_AGENT:
 # Proxy résidentiel rotatif (optionnel). Stratégie coût : IP LOCALE par défaut (gratuite) ;
 # sur un 429 en direct → bascule proxy pour PROXY_WINDOW_SECONDS (état partagé entre workers
 # via Redis), puis retour auto à l'IP locale. Le proxy ne sert donc que pendant les throttles.
+POOL_CONNEXIONS = 64   # au moins autant que de threads qui partagent la session
 PROXY_URL = os.getenv("YOUTUBE_FETCHER_PROXY_URL")
 PROXY_FLAG_KEY = "scrape:use_proxy"
 PROXY_WINDOW_SECONDS = 7200  # 2h de proxy après un 429, puis on retente l'IP locale
@@ -52,7 +53,11 @@ INNERTUBE_CONTEXT = {
 def _create_session(proxy: Optional[str] = None) -> requests.Session:
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
-    session.mount("https://", HTTPAdapter(max_retries=retry))
+    # Pool dimensionné pour l'enrichissement en volume. Par défaut urllib3 en garde dix par hôte :
+    # au-delà il jette la connexion et en rouvre une, ce qui multiplie les poignées de main TLS et
+    # finit en 403 côté YouTube (« Connection pool is full » plein les journaux).
+    session.mount("https://", HTTPAdapter(max_retries=retry, pool_maxsize=POOL_CONNEXIONS,
+                                          pool_block=False))
     session.headers.update({
         "User-Agent": YOUTUBE_USER_AGENT,
         "Accept-Language": "en-US,en;q=0.9",
@@ -316,21 +321,37 @@ def scrape_video_description(video_id: str) -> Optional[str]:
     return _dig_attributed_description(response.json())
 
 
+def _dig_view_count(data: Dict) -> Optional[int]:
+    """Vues du panneau 'next' (videoViewCountRenderer → '1 234 567 views'). Comptage EXACT, là
+    où la page de recherche ne rend que ce que son renderer veut bien afficher."""
+    renderer = _find_key_recursive(data, "videoViewCountRenderer")
+    if not isinstance(renderer, dict):
+        return None
+    view_text = (renderer.get("viewCount") or {}).get("simpleText")
+    return parse_view_count(view_text) if view_text else None
+
+
 def scrape_video_details(video_id: str) -> Optional[dict]:
-    """Description COMPLÈTE + date de publication ABSOLUE via InnerTube (youtubei/v1/next). On
-    utilise 'next' et PAS 'player' : YouTube exige un login sur 'player' (LOGIN_REQUIRED) mais laisse
-    'next' ouvert. La description vient de attributedDescription.content, la date absolue de
-    dateText.simpleText ('Aug 19, 2020' — au scrape recherche on n'a que du relatif). Renvoie
-    {description, published_date}, ou None si la vidéo est indisponible."""
+    """Description COMPLÈTE + date de publication ABSOLUE + vues via InnerTube (youtubei/v1/next).
+    On utilise 'next' et PAS 'player' : YouTube exige un login sur 'player' (LOGIN_REQUIRED) mais
+    laisse 'next' ouvert. La description vient de attributedDescription.content, la date absolue de
+    dateText.simpleText ('Aug 19, 2020' — au scrape recherche on n'a que du relatif), les vues de
+    videoViewCountRenderer. Renvoie {description, published_date, views}, ou None si la vidéo est
+    indisponible.
+
+    Une vidéo peut légitimement n'avoir aucune description tout en étant bien vivante : on ne rend
+    None que si la page ne donne NI description NI vues, seul cas où elle est vraiment introuvable.
+    """
     response = _innertube_post("next", {"videoId": video_id})
     response.raise_for_status()
     data = response.json()
     description = _dig_attributed_description(data)
-    if description is None:
+    views = _dig_view_count(data)
+    if description is None and views is None:
         return None
     date_text = _find_key_recursive(data, "dateText")
     published = _parse_watch_date(date_text.get("simpleText")) if isinstance(date_text, dict) else None
-    return {"description": description, "published_date": published}
+    return {"description": description, "published_date": published, "views": views}
 
 
 _SUBSCRIBER_RE = re.compile(r"([\d.,]+\s*[KMB]?)\s+subscribers", re.IGNORECASE)
