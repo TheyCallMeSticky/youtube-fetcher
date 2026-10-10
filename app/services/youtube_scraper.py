@@ -20,8 +20,6 @@ import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
 
-from app.core.redis import redis_conn
-
 logger = logging.getLogger(__name__)
 
 YOUTUBE_COOKIES = os.getenv("YOUTUBE_COOKIES")
@@ -32,13 +30,7 @@ YOUTUBE_USER_AGENT = os.getenv("YOUTUBE_USER_AGENT")
 if not YOUTUBE_USER_AGENT:
     raise ValueError("YOUTUBE_USER_AGENT is required")
 
-# Proxy résidentiel rotatif (optionnel). Stratégie coût : IP LOCALE par défaut (gratuite) ;
-# sur un 429 en direct → bascule proxy pour PROXY_WINDOW_SECONDS (état partagé entre workers
-# via Redis), puis retour auto à l'IP locale. Le proxy ne sert donc que pendant les throttles.
 POOL_CONNEXIONS = 64   # au moins autant que de threads qui partagent la session
-PROXY_URL = os.getenv("YOUTUBE_FETCHER_PROXY_URL")
-PROXY_FLAG_KEY = "scrape:use_proxy"
-PROXY_WINDOW_SECONDS = 7200  # 2h de proxy après un 429, puis on retente l'IP locale
 
 # InnerTube : clé et version du client web YouTube. La clé est publique et stable depuis des
 # années ; la version est très tolérante (une valeur « périmée » passe encore) → surchargeable
@@ -50,7 +42,7 @@ INNERTUBE_CONTEXT = {
 }
 
 
-def _create_session(proxy: Optional[str] = None) -> requests.Session:
+def _create_session() -> requests.Session:
     session = requests.Session()
     retry = Retry(total=3, backoff_factor=1, status_forcelist=[500, 502, 503, 504])
     # Pool dimensionné pour l'enrichissement en volume. Par défaut urllib3 en garde dix par hôte :
@@ -63,39 +55,18 @@ def _create_session(proxy: Optional[str] = None) -> requests.Session:
         "Accept-Language": "en-US,en;q=0.9",
         "Cookie": YOUTUBE_COOKIES,
     })
-    if proxy:
-        session.proxies.update({"http": proxy, "https": proxy})
     return session
 
 
-_session_direct = _create_session()
-_session_proxy = _create_session(PROXY_URL) if PROXY_URL else None
-
-
-def _proxy_window_active() -> bool:
-    """Sommes-nous dans une fenêtre proxy (429 récent, TTL non expiré) ? Partagé via Redis."""
-    return _session_proxy is not None and bool(redis_conn.exists(PROXY_FLAG_KEY))
-
-
-def _open_proxy_window() -> None:
-    """Bascule TOUS les workers sur le proxy pour PROXY_WINDOW_SECONDS."""
-    redis_conn.set(PROXY_FLAG_KEY, b"1", ex=PROXY_WINDOW_SECONDS)
-    logger.warning(f"429 sur IP locale → bascule PROXY pour {PROXY_WINDOW_SECONDS // 3600}h")
+_session = _create_session()
 
 
 def _innertube_post(endpoint: str, payload: Dict) -> requests.Response:
-    """POST vers InnerTube (youtubei/v1/{endpoint}) avec la stratégie proxy : IP locale par
-    défaut, bascule proxy 2h sur un 429 en direct (état partagé entre workers via Redis).
-    Mêmes sessions (UA + proxy) que l'ancien GET — on ne change que le transport."""
+    """POST vers InnerTube (youtubei/v1/{endpoint}), en direct. Pas de proxy : sur un 429, c'est
+    la cadence du crawl qu'on baisse (moins de workers), pas l'adresse qu'on change."""
     url = f"https://www.youtube.com/youtubei/v1/{endpoint}?key={INNERTUBE_KEY}&prettyPrint=false"
     body = {"context": INNERTUBE_CONTEXT, **payload}
-    if _proxy_window_active():
-        return _session_proxy.post(url, json=body, timeout=30)
-    response = _session_direct.post(url, json=body, timeout=30)
-    if response.status_code == 429 and _session_proxy is not None:
-        _open_proxy_window()
-        return _session_proxy.post(url, json=body, timeout=30)
-    return response
+    return _session.post(url, json=body, timeout=30)
 
 
 def scrape_search(query: str, max_results: int = 20, output_format: str = "standard") -> Optional[Dict]:
